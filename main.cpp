@@ -7,7 +7,7 @@
 
 
 const double	EPS = 1.e-6;                //точность
-const int		nGlob = 500;               // количество разбиений
+const int		nGlob = 5000;               // количество разбиений
     const double	h = 1.0 / (nGlob - 1);  // шаг
 const double	k = 1.0 / h;                // k^2*h^2=const
                         // JACseq,       JAC1,       JAC2,       JAC3,
