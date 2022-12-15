@@ -1,0 +1,8 @@
+#!/bin/sh
+#SBATCH --job-name=Lab1_Popov
+#SBATCH --time=00:15:00
+#SBATCH --nodes=1 --cpus-per-task=18
+#SBATCH --partition=release
+ulimit -l unlimited
+
+mpirun -np 1 /nethome/student/FS19/FS2-x1/Popov_Kiseleva/Lab2/run
