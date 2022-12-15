@@ -5,4 +5,4 @@
 #SBATCH --partition=release
 ulimit -l unlimited
 
-mpirun -np 1 /nethome/student/FS19/FS2-x1/Popov_Kiseleva/Lab2/run
+mpirun -np 1 /nethome/student/FS19/FS2-x1/Popov_Kiseleva/Lab3/run
