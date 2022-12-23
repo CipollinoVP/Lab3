@@ -51,7 +51,7 @@ void general_y(std::vector<int>& el_num, std::vector<double>& y_n, std::vector<d
     MPI_Gatherv((myid == 0) ? y_n.data() : y_n.data() + N, size, MPI_DOUBLE, y.data(), el_num.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
 }
 
-void analyt_sol(std::vector<double>& u)
+void analytic_solve(std::vector<double>& u)
 {
     for (int i = 0; i < N; ++i)
         for (int j = 0; j < N; ++j)
@@ -418,7 +418,7 @@ int main(int argc, char** argv)
         std::cout << "np: " << np << std::endl << std::endl;
         y_gen.resize(N * N, 0);
         u.resize(N * N);
-        analyt_sol(u);
+        analytic_solve(u);
     }
 
     if (np == 1) {
