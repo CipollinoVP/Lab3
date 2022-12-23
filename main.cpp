@@ -3,6 +3,7 @@
 #include <cmath>
 #include <vector>
 
+const double PI = 3.1415926535;
 const double eps = 1.e-5;
 const int N = 1260; //количество точек
 const double h = 1.0 / (N - 1); //шаг
@@ -14,15 +15,15 @@ const double coef = (4.0 + h * h * k * k);
 //заполняем вектор нулями
 void zero(std::vector<double>& A)
 {
-    for (double & i : A)
-        i = 0.0;
+    for (int i = 0; i < A.size(); ++i)
+        A[i] = 0.0;
 }
 
 
 //правая часть
 double	f(double x, double y)
 {
-    return 2 * sin(M_PI * y) + k * k * (1 - x) * x * sin(M_PI * y) +M_PI *M_PI * (1 - x) * x * sin(M_PI * y);
+    return 2 * sin(PI * y) + k * k * (1 - x) * x * sin(PI * y) + PI * PI * (1 - x) * x * sin(PI * y);
 }
 
 
@@ -51,11 +52,11 @@ void general_y(std::vector<int>& el_num, std::vector<double>& y_n, std::vector<d
     MPI_Gatherv((myid == 0) ? y_n.data() : y_n.data() + N, size, MPI_DOUBLE, y.data(), el_num.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
 }
 
-void analytic_solve(std::vector<double>& u)
+void analyt_sol(std::vector<double>& u)
 {
     for (int i = 0; i < N; ++i)
         for (int j = 0; j < N; ++j)
-            u[i * N + j] = (1 - i * h) * i * h * sin(M_PI * j * h);
+            u[i * N + j] = (1 - i * h) * i * h * sin(PI * j * h);
 }
 
 double Jacobi(std::vector<double>& y, std::vector<double>& y_n, std::vector<int>& el_num, int myid, int np, int& iterations, int send_type)
@@ -418,7 +419,7 @@ int main(int argc, char** argv)
         std::cout << "np: " << np << std::endl << std::endl;
         y_gen.resize(N * N, 0);
         u.resize(N * N);
-        analytic_solve(u);
+        analyt_sol(u);
     }
 
     if (np == 1) {
