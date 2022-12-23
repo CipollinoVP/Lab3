@@ -1,792 +1,501 @@
 #include <iostream>
 #include <mpi.h>
 #include <cmath>
-#include <fstream>
 #include <vector>
 
-
-
-const double	EPS = 1.e-6;                //точность
-const int		nGlob = 5000;               // количество разбиений
-    const double	h = 1.0 / (nGlob - 1);  // шаг
-const double	k = 1.0 / h;                // k^2*h^2=const
-                        // JACseq,       JAC1,       JAC2,       JAC3,
-                        // RED-BLACKseq, RED-BLACK1, RED-BLACK2, RED-BLACK3 :
-const int flag_mass[8] = {0,0,0,1,0,0,0,1};
-using namespace std;
+const double eps = 1.e-5;
+const int N = 1260; //количество точек
+const double h = 1.0 / (N - 1); //шаг
+const double k = 1.0 / h;
+const double coef = (4.0 + h * h * k * k);
 
 
 
-// исходная правая часть
-double fRight(double x, double y, double kGlob) {
-    const double	pi = 3.1415926535;
-    return 2 * sin(pi * y) + kGlob * kGlob * (1 - x) * x * sin(pi * y) + pi * pi * (1 - x) * x * sin(pi * y);
+//заполняем вектор нулями
+void zero(std::vector<double>& A)
+{
+    for (double & i : A)
+        i = 0.0;
 }
 
 
-
-// исходное аналитическое решение
-double fReal(double x, double y) {
-    const double	pi = 3.1415926535;
-    return sin(pi * y) * (1 - x) * x;
+//правая часть
+double	f(double x, double y)
+{
+    return 2 * sin(M_PI * y) + k * k * (1 - x) * x * sin(M_PI * y) +M_PI *M_PI * (1 - x) * x * sin(M_PI * y);
 }
 
 
+double norm(std::vector<double>& A, std::vector<double>& B, int i_beg, int i_end)
+{
+    double norma = 0.0;
+    for (int i = i_beg; i < i_end; ++i)
+        if (norma < fabs(A[i] - B[i]))
+            norma = fabs(A[i] - B[i]);
+    return norma;
+}
 
-// норма разности векторов (новая)
-double NormVectorDif(vector<double>& A, vector<double>& B, int i0, int iF) {
-    double sum = 0;
-    double tmp;
 
-    for (int i = i0; i < iF; i++) {
-        tmp = A[i] - B[i];
-        sum += tmp * tmp;
+void general_y(std::vector<int>& el_num, std::vector<double>& y_n, std::vector<double>& y, std::vector<int>& displs, int np, int myid)
+{
+    //реальный размер блока от каждого процесса
+    int size;
+    if ((myid == 0 || myid == np - 1) && np != 1)
+        size = el_num[myid] - N;
+    else if (np != 1)
+        size = el_num[myid] - 2 * N;
+    else
+        size = el_num[myid];
+
+    //объединение частей матрицы
+    MPI_Gatherv((myid == 0) ? y_n.data() : y_n.data() + N, size, MPI_DOUBLE, y.data(), el_num.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+}
+
+void analyt_sol(std::vector<double>& u)
+{
+    for (int i = 0; i < N; ++i)
+        for (int j = 0; j < N; ++j)
+            u[i * N + j] = (1 - i * h) * i * h * sin(M_PI * j * h);
+}
+
+double Jacobi(std::vector<double>& y, std::vector<double>& y_n, std::vector<int>& el_num, int myid, int np, int& iterations, int send_type)
+{
+    double norm_f;
+    //последовательный
+    if (np == 1)
+    {
+
+        iterations = 0;
+        do
+        {
+            ++iterations;
+            for (int i = 1; i < N - 1; ++i)
+                for (int j = 1; j < N - 1; ++j)
+                    y[i * N + j] = (h * h * f(i * h, j * h) + (y_n[i * N + j - 1] + y_n[i * N + j + 1] + y_n[(i - 1) * N + j] + y_n[(i + 1) * N + j])) / coef;
+
+            norm_f = norm(y, y_n, 0, N * N);
+            y_n.swap(y);
+        } while (norm_f > eps);
     }
-    return /*sqrt*/(sum);
-}
+    //параллельный
+    if (np > 1)
+    {
+        double norma;
 
+        int shift = 0;
+        for (int i = 0; i < myid; ++i)
+            shift += el_num[i] / N;
+        shift -= (myid == 0) ? 0 : myid * 2;
 
+        iterations = 0;
+        do
+        {
+            if (send_type == 1)
+            {
+                //передача вниз
+                MPI_Send(y_n.data() + el_num[myid] - 2 * N, (myid != np - 1) ? N : 0, MPI_DOUBLE, (myid != np - 1) ? myid + 1 : 0, 1, MPI_COMM_WORLD);
+                MPI_Recv(y_n.data(), (myid != 0) ? N : 0, MPI_DOUBLE, (myid != 0) ? myid - 1 : np - 1, 1, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
 
-// раскалываем матрицу на блоки  (massize - массив количества точек в каждом блоке с учетом добавочных строк)
-void findSize(vector<int>& massize, int np, int id) {
-    if (id == 0) {
-        // заполнение массива высот без учета добавочных строк
-        // если высота сетки делится нацело на количество процессов
-        if( nGlob % np == 0 ) {
-            for (int i = 0; i < np; i++) {
-                massize[i] = (nGlob / np) * nGlob;    // (nGlob / np) - высота блока, nGlob - длина блока
+                //передача вверх
+                MPI_Send(y_n.data() + N, (myid != 0) ? N : 0, MPI_DOUBLE, (myid != 0) ? myid - 1 : np - 1, 2, MPI_COMM_WORLD);
+                MPI_Recv(y_n.data() + el_num[myid] - N, (myid != np - 1) ? N : 0, MPI_DOUBLE, (myid != np - 1) ? myid + 1 : 0, 2, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
             }
-        } else {
-            cout << "( nGlob % np != 0 )" << endl;
-            // округляем (nGlob / np) и присваиваем это значение-высоту каждому процессу кроме последнего. Последний берет остаток
-            int sum_of_heights_without_last = 0;
-            for (int i = 0; i < np - 1; i++) {
-                massize[i] = round(((double)nGlob / (double)np)) * nGlob;
-                sum_of_heights_without_last += massize[i] / nGlob;
-            }
-            massize[np - 1] = (nGlob - sum_of_heights_without_last) * nGlob;
-        }
+            if (send_type == 2)
+            {
+                //передать вниз и принять сверху
+                MPI_Sendrecv(y_n.data() + el_num[myid] - 2 * N, (myid != np - 1) ? N : 0, MPI_DOUBLE, (myid != np - 1) ? myid + 1 : 0, 3, y_n.data(), (myid != 0) ? N : 0, MPI_DOUBLE, (myid != 0) ? myid - 1 : np - 1, 3, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
 
-        for (int i = 1; i < np - 1; i++) //учет добавочных строк (сверху и снизу)
-            massize[i] += 2 * nGlob;
-        massize[0] += nGlob;
-        massize[np - 1] += nGlob;
+                //передать вверх и принять снизу
+                MPI_Sendrecv(y_n.data() + N, (myid != 0) ? N : 0, MPI_DOUBLE, (myid != 0) ? myid - 1 : np - 1, 4, y_n.data() + el_num[myid] - N, (myid != np - 1) ? N : 0, MPI_DOUBLE, (myid != np - 1) ? myid + 1 : 0, 4, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
+
+            }
+            MPI_Request req_send_up, req_recv_up, req_send_down, req_recv_down;
+            if (send_type == 3)
+            {
+                if (myid != np - 1)
+                {
+                    //передача вниз
+                    MPI_Isend(y_n.data() + el_num[myid] - 2 * N, N, MPI_DOUBLE, myid + 1, 5, MPI_COMM_WORLD, &req_send_up);
+
+                    //прием снизу
+                    MPI_Irecv(y_n.data() + el_num[myid] - N, N, MPI_DOUBLE, myid + 1, 6, MPI_COMM_WORLD, &req_recv_up);
+                }
+                if (myid != 0)
+                {
+                    //прием сверху
+                    MPI_Irecv(y_n.data(), N, MPI_DOUBLE, myid - 1, 5, MPI_COMM_WORLD, &req_recv_down);
+
+                    //передача вверх
+                    MPI_Isend(y_n.data() + N, N, MPI_DOUBLE, myid - 1, 6, MPI_COMM_WORLD, &req_send_down);
+                }
+            }
+
+            ++iterations;
+
+            if (send_type == 1 || send_type == 2)
+            {
+                for (int i = 1; i < el_num[myid] / N - 1; ++i)
+                    for (int j = 1; j < N - 1; ++j)
+                        y[i * N + j] = (h * h * f((i + shift) * h, j * h) + (y_n[i * N + j - 1] + y_n[i * N + j + 1] + y_n[(i - 1) * N + j] + y_n[(i + 1) * N + j])) / coef;
+            }
+            if (send_type == 3)
+            {
+                //все строки, кроме верхней и нижней
+                for (int i = 2; i < el_num[myid] / N - 2; ++i)
+                    for (int j = 1; j < N - 1; ++j)
+                        y[i * N + j] = (h * h * f((i + shift) * h, j * h) + (y_n[i * N + j - 1] + y_n[i * N + j + 1] + y_n[(i - 1) * N + j] + y_n[(i + 1) * N + j])) / coef;
+
+                if (myid != 0)
+                    MPI_Wait(&req_recv_down, MPI_STATUSES_IGNORE);
+                if (myid != np - 1)
+                    MPI_Wait(&req_recv_up, MPI_STATUSES_IGNORE);
+
+                //верхняя строка
+                int i = 1;
+                for (int j = 1; j < N - 1; ++j)
+                    y[i * N + j] = (h * h * f((i + shift) * h, j * h) + (y_n[i * N + j - 1] + y_n[i * N + j + 1] + y_n[(i - 1) * N + j] + y_n[(i + 1) * N + j])) / coef;
+
+                //нижняя строка
+                i = el_num[myid] / N - 2;
+                for (int j = 1; j < N - 1; ++j)
+                    y[i * N + j] = (h * h * f((i + shift) * h, j * h) + (y_n[i * N + j - 1] + y_n[i * N + j + 1] + y_n[(i - 1) * N + j] + y_n[(i + 1) * N + j])) / coef;
+            }
+
+            norma = norm(y, y_n, (myid == 0) ? 0 : N, (myid == np) ? el_num[myid] : el_num[myid] - N);
+            MPI_Allreduce(&norma, &norm_f, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            y_n.swap(y);
+        } while (norm_f > eps);
     }
-
-    // Один передаёт всем.
-    //Параметры: что передаём, количество, тип данных, ранг процесса выполняющего рассылку, коммуникатор
-    MPI_Bcast(massize.data(), np, MPI_INT, 0, MPI_COMM_WORLD);  //раздаем массив количества точек в блоках всем
-}
-
-
-
-//сбор кусочков решения в одно
-void allSol(vector<int>& massize, vector<double>& sol, int np, int id) {
-    vector<int>	disp(np); //массив смещений (количества точек от начала сетки до начала блока) без учета добавочных строк
-
-    //размер принимаемого блока от каждого процесса
-    int size;       //massize[] без учёта доп строк
-    if ((id == 0 || id == np - 1) && np != 1) {
-        size = massize[id] - nGlob;
-    } else if (np != 1) {
-        size = massize[id] - 2 * nGlob;
-    } else {
-        size = massize[id];
+    if (myid == 0) {
+        if (send_type == 1) {
+            std::cout << "Jacobi" << " (MPI_Send + MPI_Recv)\n";
+        }
+        else if (send_type == 2) {
+            std::cout << "Jacobi" << " (MPI_SendRecv)\n";
+        }
+        else if (send_type == 3) {
+            std::cout << "Jacobi" << " (MPI_ISend + MPI_IRecv)\n";
+        }
     }
+    return norm_f;
+}
 
-    //считаем смещения (массив расстояний (количества точек сетки) блоков от начала сетки для каждого процесса)
-    if (id == 0) {
-        disp[0] = 0;
-        for (int i = 1; i < np; i++)
-            disp[i] = disp[i - 1] + size;
+
+
+double Zeidel(std::vector<double>& y, std::vector<double>& y_n, std::vector<int> el_num, int myid, int np, int& iterations, int send_type)
+{
+    double norm_f;
+    //последовательный
+    if (np == 1)
+    {
+        iterations = 0;
+        do
+        {
+            ++iterations;
+            for (int i = 1; i < N - 1; ++i)
+                for (int j = (i % 2) + 1; j < N - 1; j += 2)
+                    y[i * N + j] = (h * h * f(i * h, j * h) + (y_n[i * N + j - 1] + y_n[i * N + j + 1] + y_n[(i - 1) * N + j] + y_n[(i + 1) * N + j])) / coef;
+
+            for (int i = 1; i < N - 1; ++i)
+                for (int j = ((i + 1) % 2) + 1; j < N - 1; j += 2)
+                    y[i * N + j] = (h * h * f(i * h, j * h) + (y[i * N + j - 1] + y[i * N + j + 1] + y[(i - 1) * N + j] + y[(i + 1) * N + j])) / coef;
+
+            norm_f = norm(y, y_n, 0, N * N);
+            y_n.swap(y);
+        } while (norm_f > eps);
     }
-    MPI_Bcast(disp.data(), np, MPI_INT, 0, MPI_COMM_WORLD);     //раздаем массив размеров смещений всем
+    //параллельный
+    if (np > 1)
+    {
+        double norma;
 
-    // именно ..v на случай неделения нацело nGlob на np (тогда size-ы будут не одинаковыми)
-    //Объединение частей матрицы. Все передают одному. (Параметры: что передаём, количество, тип данных, что получаем, тип данных, ранг процесса выполняющего сбор данных, коммуникатор)
-    MPI_Gatherv((id == 0) ? MPI_IN_PLACE : sol.data() + nGlob, size, MPI_DOUBLE, sol.data(), massize.data(), disp.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        int shift = 0;
+        for (int i = 0; i < myid; ++i)
+            shift += el_num[i] / N;
+        shift -= (myid == 0) ? 0 : myid * 2;
 
-}
+        iterations = 0;
+        do
+        {
+            if (send_type == 1)
+            {
+                //передача вниз
+                MPI_Send(y_n.data() + el_num[myid] - 2 * N, (myid != np - 1) ? N : 0, MPI_DOUBLE, (myid != np - 1) ? myid + 1 : 0, 1, MPI_COMM_WORLD);
+                MPI_Recv(y_n.data(), (myid != 0) ? N : 0, MPI_DOUBLE, (myid != 0) ? myid - 1 : np - 1, 1, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
 
-
-
-// вычисление аналитического решения на сетке
-void fToGridReal(vector<double>& solReal, double step) {
-    for (int i = 0; i < nGlob; i++)
-        for (int j = 0; j < nGlob; j++)
-            solReal[i * nGlob + j] = fReal(i * step, j * step);
-}
-
-
-
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-
-
-//метод Якоби последовательный
-double Jacobi_seq(vector<double>& sol, vector<double>& solPrev, int& iter) {
-    double normFinal;
-    double coeff = (4. + h * h * k * k);
-
-    iter = 0;
-    do {
-        iter++;
-        for (int i = 1; i < nGlob - 1; i++) // метод Якоби
-            for (int j = 1; j < nGlob - 1; j++)
-                sol[i * nGlob + j] = (h * h * fRight(i * h, j * h, k) + (solPrev[i * nGlob + j - 1] + solPrev[i * nGlob + j + 1] + solPrev[(i - 1) * nGlob + j] + solPrev[(i + 1) * nGlob + j])) / coeff;
-
-        normFinal = sqrt(NormVectorDif(sol, solPrev, 0, nGlob * nGlob));
-
-        solPrev.swap(sol);
-    } while (normFinal > EPS);
-
-    return normFinal;
-}
-
-
-
-// процедура передачи строк между процессами (используется в RedBlack_3 и во всех Jacobi_PAR)
-void func_transfer(vector<double>& solPrev, vector<int>& massize, int id, int np, int iter, MPI_Request* reqSENDsAB, MPI_Request* reqRESVsAB, MPI_Request* reqSENDsBA, MPI_Request* reqRESVsBA, int flag_meth) {
-    switch (flag_meth) {
-        // JACOBI_1 (Send + Recv)
-        case 1: {
-            // принимаем доп строки, отправляем крайние НЕдоп строки
-            // 1 отправка вниз (волна вниз) (первый параметр - отступаем от верха блока (от начала верхней доп. строки) столько чтобы попасть на начало нижней НЕдоп. строки)
-            MPI_Send(solPrev.data() + massize[id] - 2 * nGlob, (id != np - 1) ? nGlob : 0, MPI_DOUBLE, (id != np - 1) ? id + 1 : 0, 56, MPI_COMM_WORLD);
-            // 2 принятие сверху (волна вниз) (первый параметр - принимаем строку сверху поэтому кладём её в самый верх нашего блока, т.е. в верхную доп строку)
-            MPI_Recv(solPrev.data(), nGlob, MPI_DOUBLE, (id != 0) ? id - 1 : np - 1, 56, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
-
-            // 3 отправка вверх (волна вверх) (первый параметр - отступаем от начала верхней доп строки одну строку чтобы попасть (и передать) на первую НЕдоп строку)
-            MPI_Send(solPrev.data() + nGlob, (id != 0) ? nGlob : 0, MPI_DOUBLE, (id != 0) ? id - 1 : np - 1, 65, MPI_COMM_WORLD);
-            // 4 принятие снизу (волна вверх) (первый параметр - отступаем от начала верхней доп строки стольуо чтобы попасть на начало нижней доп строки)
-            MPI_Recv(solPrev.data() + massize[id] - nGlob, (id != np - 1) ? nGlob : 0, MPI_DOUBLE, (id != np - 1) ? id + 1 : 0, 65, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
-        }
-            break;
-        // JACOBI_2 (Sendrecv)
-        case 2: {
-            // 1 и 2 (волна пересылок вниз, тег всегда 56) отправить вниз, а принять сверху
-            MPI_Sendrecv(solPrev.data() + massize[id] - 2 * nGlob, (id != np - 1) ? nGlob : 0, MPI_DOUBLE, (id != np - 1) ? id + 1 : 0, 56, solPrev.data(), (id != 0) ? nGlob : 0, MPI_DOUBLE, (id != 0) ? id - 1 : np - 1, 56, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
-
-            // 3 и 4(волна пересылок вверх, тег всегда 65) отправляем вверх, принимаем снизу
-            MPI_Sendrecv(solPrev.data() + nGlob, (id != 0) ? nGlob : 0, MPI_DOUBLE, (id != 0) ? id - 1 : np - 1, 65, solPrev.data() + massize[id] - nGlob, (id != np - 1) ? nGlob : 0, MPI_DOUBLE, (id != np - 1) ? id + 1 : 0, 65, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
-        }
-            break;
-        // JACOBI_3 & RED-BLACK_3 (Isend + Irecv)
-        case 3: {
-            if (iter % 2 == 0) {
-                // Ч Ë Т   I T E R
-                MPI_Startall(2, reqSENDsAB);
-                MPI_Startall(2, reqRESVsAB);
+                //передача вверх
+                MPI_Send(y_n.data() + N, (myid != 0) ? N : 0, MPI_DOUBLE, (myid != 0) ? myid - 1 : np - 1, 2, MPI_COMM_WORLD);
+                MPI_Recv(y_n.data() + el_num[myid] - N, (myid != np - 1) ? N : 0, MPI_DOUBLE, (myid != np - 1) ? myid + 1 : 0, 2, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
             }
-            else {
-                // Н Е Ч Ë Т   I T E R
-                MPI_Startall(2, reqSENDsBA);
-                MPI_Startall(2, reqRESVsBA);
+            if (send_type == 2)
+            {
+                //передать вниз и принять сверху
+                MPI_Sendrecv(y_n.data() + el_num[myid] - 2 * N, (myid != np - 1) ? N : 0, MPI_DOUBLE, (myid != np - 1) ? myid + 1 : 0, 3, y_n.data(), (myid != 0) ? N : 0, MPI_DOUBLE, (myid != 0) ? myid - 1 : np - 1, 3, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
+
+                //передать вверх и принять снизу
+                MPI_Sendrecv(y_n.data() + N, (myid != 0) ? N : 0, MPI_DOUBLE, (myid != 0) ? myid - 1 : np - 1, 4, y_n.data() + el_num[myid] - N, (myid != np - 1) ? N : 0, MPI_DOUBLE, (myid != np - 1) ? myid + 1 : 0, 4, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
+            }
+            MPI_Request req_send_up, req_recv_up, req_send_down, req_recv_down;
+            if (send_type == 3)
+            {
+
+                if (myid != np - 1)
+                {
+                    //передача вниз
+                    MPI_Isend(y_n.data() + el_num[myid] - 2 * N, N, MPI_DOUBLE, myid + 1, 5, MPI_COMM_WORLD, &req_send_up);
+                    MPI_Irecv(y_n.data() + el_num[myid] - N, N, MPI_DOUBLE, myid + 1, 6, MPI_COMM_WORLD, &req_recv_up);
+                }
+                if (myid != 0)
+                {
+                    //передача вверх
+                    MPI_Irecv(y_n.data(), N, MPI_DOUBLE, myid - 1, 5, MPI_COMM_WORLD, &req_recv_down);
+                    MPI_Isend(y_n.data() + N, N, MPI_DOUBLE, myid - 1, 6, MPI_COMM_WORLD, &req_send_down);
+                }
             }
 
-        }
-            break;
-        default:
-            cout << "ERROR CASE in func_transfer()\n";
+            ++iterations;
+
+            if (send_type == 1 || send_type == 2)
+            {
+                for (int i = 1; i < el_num[myid] / N - 1; ++i)
+                    for (int j = ((i + shift) % 2) + 1; j < N - 1; j += 2)
+                        y[i * N + j] = (h * h * f((i + shift) * h, j * h) + (y_n[i * N + j - 1] + y_n[i * N + j + 1] + y_n[(i - 1) * N + j] + y_n[(i + 1) * N + j])) / coef;
+            }
+            if (send_type == 3)
+            {
+                //все строки, кроме верхней и нижней
+                for (int i = 2; i < el_num[myid] / N - 2; ++i)
+                    for (int j = ((i + shift) % 2) + 1; j < N - 1; j += 2)
+                        y[i * N + j] = (h * h * f((i + shift) * h, j * h) + (y_n[i * N + j - 1] + y_n[i * N + j + 1] + y_n[(i - 1) * N + j] + y_n[(i + 1) * N + j])) / coef;
+
+                if (myid != 0)
+                    MPI_Wait(&req_recv_down, MPI_STATUSES_IGNORE);
+                if (myid != np - 1)
+                    MPI_Wait(&req_recv_up, MPI_STATUSES_IGNORE);
+
+                //верхняя строка
+                int i = 1;
+                for (int j = ((i + shift) % 2) + 1; j < N - 1; ++j)
+                    y[i * N + j] = (h * h * f((i + shift) * h, j * h) + (y_n[i * N + j - 1] + y_n[i * N + j + 1] + y_n[(i - 1) * N + j] + y_n[(i + 1) * N + j])) / coef;
+
+                //нижняя строка
+                i = el_num[myid] / N - 2;
+                for (int j = ((i + shift) % 2) + 1; j < N - 1; ++j)
+                    y[i * N + j] = (h * h * f((i + shift) * h, j * h) + (y_n[i * N + j - 1] + y_n[i * N + j + 1] + y_n[(i - 1) * N + j] + y_n[(i + 1) * N + j])) / coef;
+            }
+
+            if (send_type == 1)
+            {
+                //передача вниз
+                MPI_Send(y.data() + el_num[myid] - 2 * N, (myid != np - 1) ? N : 0, MPI_DOUBLE, (myid != np - 1) ? myid + 1 : 0, 1, MPI_COMM_WORLD);
+                MPI_Recv(y.data(), (myid != 0) ? N : 0, MPI_DOUBLE, (myid != 0) ? myid - 1 : np - 1, 1, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
+
+                //передача вверх
+                MPI_Send(y.data() + N, (myid != 0) ? N : 0, MPI_DOUBLE, (myid != 0) ? myid - 1 : np - 1, 2, MPI_COMM_WORLD);
+                MPI_Recv(y.data() + el_num[myid] - N, (myid != np - 1) ? N : 0, MPI_DOUBLE, (myid != np - 1) ? myid + 1 : 0, 2, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
+            }
+            if (send_type == 2)
+            {
+                //передать вниз и принять сверху
+                MPI_Sendrecv(y.data() + el_num[myid] - 2 * N, (myid != np - 1) ? N : 0, MPI_DOUBLE, (myid != np - 1) ? myid + 1 : 0, 3, y.data(), (myid != 0) ? N : 0, MPI_DOUBLE, (myid != 0) ? myid - 1 : np - 1, 3, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
+
+                //передать вверх и принять снизу
+                MPI_Sendrecv(y.data() + N, (myid != 0) ? N : 0, MPI_DOUBLE, (myid != 0) ? myid - 1 : np - 1, 4, y.data() + el_num[myid] - N, (myid != np - 1) ? N : 0, MPI_DOUBLE, (myid != np - 1) ? myid + 1 : 0, 4, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
+            }
+            if (send_type == 3)
+            {
+                if (myid != np - 1)
+                {
+                    //передача вниз
+                    MPI_Isend(y.data() + el_num[myid] - 2 * N, N, MPI_DOUBLE, myid + 1, 5, MPI_COMM_WORLD, &req_send_up);
+                    MPI_Irecv(y.data() + el_num[myid] - N, N, MPI_DOUBLE, myid + 1, 6, MPI_COMM_WORLD, &req_recv_up);
+                }
+                if (myid != 0)
+                {
+                    //передача вверх
+                    MPI_Irecv(y.data(), N, MPI_DOUBLE, myid - 1, 5, MPI_COMM_WORLD, &req_recv_down);
+                    MPI_Isend(y.data() + N, N, MPI_DOUBLE, myid - 1, 6, MPI_COMM_WORLD, &req_send_down);
+                }
+            }
+
+            if (send_type == 1 || send_type == 2)
+            {
+                for (int i = 1; i < el_num[myid] / N - 1; ++i)
+                    for (int j = (((i + shift) + 1) % 2) + 1; j < N - 1; j += 2)
+                        y[i * N + j] = (h * h * f((i + shift) * h, j * h) + (y[i * N + j - 1] + y[i * N + j + 1] + y[(i - 1) * N + j] + y[(i + 1) * N + j])) / coef;
+            }
+            if (send_type == 3)
+            {
+                //все строки, кроме верхней и нижней
+                for (int i = 2; i < el_num[myid] / N - 2; ++i)
+                    for (int j = (((i + shift) + 1) % 2) + 1; j < N - 1; j += 2)
+                        y[i * N + j] = (h * h * f((i + shift) * h, j * h) + (y[i * N + j - 1] + y[i * N + j + 1] + y[(i - 1) * N + j] + y[(i + 1) * N + j])) / coef;
+
+                if (myid != 0)
+                    MPI_Wait(&req_recv_down, MPI_STATUSES_IGNORE);
+                if (myid != np - 1)
+                    MPI_Wait(&req_recv_up, MPI_STATUSES_IGNORE);
+
+                //верхняя строка
+                int i = 1;
+                for (int j = (((i + shift) + 1) % 2) + 1; j < N - 1; j += 2)
+                    y[i * N + j] = (h * h * f((i + shift) * h, j * h) + (y[i * N + j - 1] + y[i * N + j + 1] + y[(i - 1) * N + j] + y[(i + 1) * N + j])) / coef;
+
+                //нижняя строка
+                i = el_num[myid] / N - 2;
+                for (int j = (((i + shift) + 1) % 2) + 1; j < N - 1; j += 2)
+                    y[i * N + j] = (h * h * f((i + shift) * h, j * h) + (y[i * N + j - 1] + y[i * N + j + 1] + y[(i - 1) * N + j] + y[(i + 1) * N + j])) / coef;
+
+            }
+
+            norma = norm(y, y_n, (myid == 0) ? 0 : N, (myid == np) ? el_num[myid] : el_num[myid] - N);
+            MPI_Allreduce(&norma, &norm_f, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            y_n.swap(y);
+        } while (norm_f > eps);
     }
+    if (myid == 0) {
+        if (send_type == 1) {
+            std::cout << "Zeidel" << " (MPI_Send + MPI_Recv)\n";
+        }
+        else if (send_type == 2) {
+            std::cout << "Zeidel" << " (MPI_SendRecv)\n";
+        }
+        else if (send_type == 3) {
+            std::cout << "Zeidel" << " (MPI_ISend + MPI_IRecv)\n";
+        }
+    }
+    return norm_f;
 }
 
-
-
-// общая функция для параллельных методов Якоби
-double Jacobi_PAR(vector<double>& sol, vector<double>& solPrev, vector<int>& massize, int id, int np, int& iter, int flag_meth) {
-    double locnorm, normFinal; //locnorm -- локальная погрешность блока, данного каждому процессору для вычисления нормы ошибки
-    double coeff = (4. + h * h * k * k);
-
-    // сдвиг по высоте сетки для каждого процесса, то есть начало верхней доп. строки для каждого блока
-    int shift = 0; // равно нулю для нулевого процессора
-
-    if(id == np - 1) {
-        shift = nGlob - (massize[id] / nGlob); // поднимаемся с конца на высоту последнего блока с учётом доп строки
-    } else if(id != 0) {
-        shift = id * (massize[id] / nGlob - 2) - 1; //спускаемся с начала на id*(высота среднего блока без учета доп строк) и поднимаемся на одну доп строку
-    }
-
-    // нужно только для Isend + Irecv
-    MPI_Request* reqSENDsAB = new MPI_Request[2];
-    MPI_Request* reqRESVsAB = new MPI_Request[2];
-    MPI_Request* reqSENDsBA = new MPI_Request[2];
-    MPI_Request* reqRESVsBA = new MPI_Request[2];
-
-    // И Н И Ц И А Л И З А Ц И Я   I s e n d   нужно только для Isend + Irecv
-    if (flag_meth == 3) {
-        // Ч Ë Т   I T E R
-        // 1 Отправляем сверху вниз AB
-        MPI_Send_init(solPrev.data() + massize[id] - 2 * nGlob, (id != np - 1) ? nGlob : 0, MPI_DOUBLE,(id != np - 1) ? id + 1 : 0, 56, MPI_COMM_WORLD, reqSENDsAB);
-        // 4 Получаем снизу вверх AB
-        MPI_Recv_init(solPrev.data() + massize[id] - nGlob, (id != np - 1) ? nGlob : 0, MPI_DOUBLE,(id != np - 1) ? id + 1 : 0, 65, MPI_COMM_WORLD, reqRESVsAB);
-        // 3 Отправляем снизу вверх AB
-        MPI_Send_init(solPrev.data() + nGlob, (id != 0) ? nGlob : 0, MPI_DOUBLE, (id != 0) ? id - 1 : np - 1, 65,MPI_COMM_WORLD, reqSENDsAB + 1);
-        // 2 Получаем сверху вниз AB
-        MPI_Recv_init(solPrev.data(), (id != 0) ? nGlob : 0, MPI_DOUBLE, (id != 0) ? id - 1 : np - 1, 56,MPI_COMM_WORLD, reqRESVsAB + 1);
-
-        // Н Е Ч Ë Т   I T E R
-        // 1 Отправляем сверху вниз BA
-        MPI_Send_init(sol.data() + massize[id] - 2 * nGlob, (id != np - 1) ? nGlob : 0, MPI_DOUBLE,(id != np - 1) ? id + 1 : 0, 56, MPI_COMM_WORLD, reqSENDsBA);
-        // 4 Получаем снизу вверх BA
-        MPI_Recv_init(sol.data() + massize[id] - nGlob, (id != np - 1) ? nGlob : 0, MPI_DOUBLE,(id != np - 1) ? id + 1 : 0, 65, MPI_COMM_WORLD, reqRESVsBA);
-        // 3 Отправляем снизу вверх BA
-        MPI_Send_init(sol.data() + nGlob, (id != 0) ? nGlob : 0, MPI_DOUBLE, (id != 0) ? id - 1 : np - 1, 65,MPI_COMM_WORLD, reqSENDsBA + 1);
-        // 2 Получаем сверху вниз BA
-        MPI_Recv_init(sol.data(), (id != 0) ? nGlob : 0, MPI_DOUBLE, (id != 0) ? id - 1 : np - 1, 56, MPI_COMM_WORLD,reqRESVsBA + 1);
-    }
-
-    iter = 0;
-    do {
-        func_transfer(solPrev, massize, id, np, iter, reqSENDsAB, reqRESVsAB, reqSENDsBA, reqRESVsBA, flag_meth);
-
-        //центральная часть (без первой и последней НЕдоп. строки)
-        for (int i = 2; i < massize[id] / nGlob - 2; i++)
-            for (int j = 1; j < nGlob - 1; j++)
-                sol[i * nGlob + j] = (h * h * fRight((i + shift) * h, j * h, k) + (solPrev[i * nGlob + j - 1] + solPrev[i * nGlob + j + 1] + solPrev[(i - 1) * nGlob + j] + solPrev[(i + 1) * nGlob + j])) / coeff;
-
-        // опять же только для Isend + Irecv
-        if (flag_meth == 3) {
-                MPI_Waitall(2, (iter % 2 == 0) ? reqSENDsAB : reqSENDsBA, MPI_STATUSES_IGNORE);
-                MPI_Waitall(2, (iter % 2 == 0) ? reqRESVsAB : reqRESVsBA, MPI_STATUSES_IGNORE);
-        }
-
-        // начало блока (расчет первой НЕдоп. строки блока)
-        int i = 1;
-        for (int j = 1; j < nGlob - 1; j++)
-            sol[i * nGlob + j] = (h * h * fRight((i + shift) * h, j * h, k) + (solPrev[i * nGlob + j - 1] + solPrev[i * nGlob + j + 1] + solPrev[(i - 1) * nGlob + j] + solPrev[(i + 1) * nGlob + j])) / coeff;
-
-        //конец блока (расчет последней НЕдоп. строки блока)
-        i = massize[id] / nGlob - 2;
-        for (int j = 1; j < nGlob - 1; j++)
-            sol[i * nGlob + j] = (h * h * fRight((i + shift) * h, j * h, k) + (solPrev[i * nGlob + j - 1] + solPrev[i * nGlob + j + 1] + solPrev[(i - 1) * nGlob + j] + solPrev[(i + 1) * nGlob + j])) / coeff;
-
-        locnorm = NormVectorDif(sol, solPrev, (id == 0) ? 0 : nGlob,(id == np-1) ? massize[id] : massize[id] - nGlob);
-        // объединяет значения из всех процессов и распределяет результат обратно во все процессы.
-        // что отправляем, что получает, количество , тип, ОПРЕДЕЛЕНИЕ МАКСИМАЛЬНОГО ЗНАЧЕНИЯ, коммуникатор
-        MPI_Allreduce(&locnorm, &normFinal, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        normFinal = sqrt(normFinal);
-
-        solPrev.swap(sol);
-
-        iter++;
-
-        //cout << iter << ": " << normFinal << endl;
-
-    } while (normFinal > EPS);
-
-    return normFinal;
-}
-
-
-
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-
-
-//метод красно-черных итераций последовательный
-double RedBlack_seq(vector<double>& sol, vector<double>& solPrev, int& iter) {
-    double normFinal;
-
-    double coeff = (4. + h * h * k * k);
-
-    iter = 0;
-    do {
-        for (int i = 1; i < nGlob - 1; i++) // метод красно-черных
-            for (int j = (i % 2) + 1; j < nGlob - 1; j += 2)
-
-                sol[i * nGlob + j] = (h * h * fRight(i * h, j * h, k) + (solPrev[i * nGlob + j - 1] + solPrev[i * nGlob + j + 1] + solPrev[(i - 1) * nGlob + j] + solPrev[(i + 1) * nGlob + j])) / coeff;
-
-        for (int i = 1; i < nGlob - 1; i++) // метод красно-черных
-            for (int j = ((i + 1) % 2) + 1; j < nGlob - 1; j += 2)
-
-                sol[i * nGlob + j] = (h * h * fRight(i * h, j * h, k) + (sol[i * nGlob + j - 1] + sol[i * nGlob + j + 1] + sol[(i - 1) * nGlob + j] + sol[(i + 1) * nGlob + j])) / coeff;
-
-        normFinal = sqrt(NormVectorDif(sol, solPrev, 0, nGlob * nGlob));
-
-        solPrev.swap(sol);
-
-        iter++;
-
-    } while (normFinal > EPS);
-
-    return normFinal;
-}
-
-
-
-//метод красно-черных send+recv
-double RedBlack_1(vector<double>& sol, vector<double>& solPrev, vector<int> massize, int id, int np, int& iter) {
-    double locnorm, normFinal = 0;
-
-    double coeff = (4. + h * h * k * k);
-
-    // сдвиг по высоте сетки для каждого процесса, то есть начало верхней доп. строки для каждого блока
-    int shift = 0; // равно нулю для нулевого процессора
-
-    if (id == np - 1) {
-        shift = nGlob - (massize[id] / nGlob); // поднимаемся с конца на высоту последнего блока с учётом доп строки
-    } else if (id != 0){
-        shift = id * (massize[id] / nGlob - 2) - 1; //спускаемся с начала на id*(высота среднего блока без учета доп строк) и поднимаемся на одну доп строку
-    }
-
-    iter = 0;
-    do {
-        // 1
-        MPI_Send(solPrev.data() + massize[id] - 2 * nGlob, (id != np - 1) ? nGlob : 0, MPI_DOUBLE,   (id != np - 1) ? id + 1 : 0, 56, MPI_COMM_WORLD);
-        // 2
-        MPI_Recv(solPrev.data(),                           (id != 0) ? nGlob : 0,      MPI_DOUBLE, (id != 0) ? id - 1 : np - 1, 56, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
-        // 3
-        MPI_Send(solPrev.data() + nGlob,                   (id != 0) ? nGlob : 0,      MPI_DOUBLE,   (id != 0) ? id - 1 : np - 1, 65, MPI_COMM_WORLD);
-        // 4
-        MPI_Recv(solPrev.data() + massize[id] - nGlob,     (id != np - 1) ? nGlob : 0, MPI_DOUBLE, (id != np - 1) ? id + 1 : 0, 65, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
-
-        for (int i = 1; i < massize[id] / nGlob - 1; i++) // метод красно-черных
-            for (int j = ((i + shift) % 2) + 1; j < nGlob - 1; j += 2) {
-                sol[i * nGlob + j] = (h * h * fRight((i + shift) * h, j * h, k) + (solPrev[i * nGlob + j - 1] + solPrev[i * nGlob + j + 1] + solPrev[(i - 1) * nGlob + j] + solPrev[(i + 1) * nGlob + j])) / coeff;
-            }
-
-        // 1
-        MPI_Send(sol.data() + massize[id] - 2 * nGlob, (id != np - 1) ? nGlob : 0, MPI_DOUBLE,   (id != np - 1) ? id + 1 : 0, 56, MPI_COMM_WORLD);//0
-        // 2
-        MPI_Recv(sol.data(),                           (id != 0) ? nGlob : 0,      MPI_DOUBLE, (id != 0) ? id - 1 : np - 1, 56, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);//2
-        // 3
-        MPI_Send(sol.data() + nGlob,                   (id != 0) ? nGlob : 0,      MPI_DOUBLE,   (id != 0) ? id - 1 : np - 1, 65, MPI_COMM_WORLD);//1
-        // 4
-        MPI_Recv(sol.data() + massize[id] - nGlob,     (id != np - 1) ? nGlob : 0, MPI_DOUBLE, (id != np - 1) ? id + 1 : 0, 65, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
-
-
-        for (int i = 1; i < massize[id] / nGlob - 1; i++) // метод красно-черных
-            for (int j = (((i + shift) + 1) % 2) + 1; j < nGlob - 1; j += 2) {
-                sol[i * nGlob + j] = (h * h * fRight((i + shift) * h, j * h, k) + (sol[i * nGlob + j - 1] + sol[i * nGlob + j + 1] + sol[(i - 1) * nGlob + j] + sol[(i + 1) * nGlob + j])) / coeff;
-            }
-
-        locnorm = NormVectorDif(sol, solPrev, (id == 0) ? 0 : nGlob, (id == np) ? massize[id] : massize[id] - nGlob);
-        MPI_Allreduce(&locnorm, &normFinal, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        normFinal = sqrt(normFinal);
-
-        solPrev.swap(sol);
-
-        iter++;
-
-    } while (normFinal > EPS);
-
-    return normFinal;
-}
-
-
-
-//метод красно-черных sendrecv
-double RedBlack_2(vector<double>& sol, vector<double>& solPrev, vector<int> massize, int id, int np, int& iter) {
-    double locnorm, normFinal;
-
-    double coeff = (4. + h * h * k * k);
-
-    // сдвиг по высоте сетки для каждого процесса, то есть начало верхней доп. строки для каждого блока
-    int shift = 0; // равно нулю для нулевого процессора
-
-    if (id == np - 1) {
-        shift = nGlob - (massize[id] / nGlob); // поднимаемся с конца на высоту последнего блока с учётом доп строки
-    } else if (id != 0){
-        shift = id * (massize[id] / nGlob - 2) - 1; //спускаемся с начала на id*(высота среднего блока без учета доп строк) и поднимаемся на одну доп строку
-    }
-
-    iter = 0;
-    do {
-        MPI_Sendrecv(solPrev.data() + massize[id] - 2 * nGlob, (id != np - 1) ? nGlob : 0, MPI_DOUBLE,  (id != np - 1) ? id + 1 : 0, 56, \
-                     solPrev.data(),                            (id != 0) ? nGlob : 0,      MPI_DOUBLE, (id != 0) ? id - 1 : np - 1, 56, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
-        MPI_Sendrecv(solPrev.data() + nGlob,                   (id != 0) ? nGlob : 0,      MPI_DOUBLE,  (id != 0) ? id - 1 : np - 1, 65, \
-                     solPrev.data() + massize[id] - nGlob,      (id != np - 1) ? nGlob : 0, MPI_DOUBLE, (id != np - 1) ? id + 1 : 0, 65, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
-
-        for (int i = 1; i < massize[id] / nGlob - 1; i++) // метод красно-черных
-            for (int j = ((i + shift) % 2) + 1; j < nGlob - 1; j += 2)
-                sol[i * nGlob + j] = (h * h * fRight((i + shift) * h, j * h, k) + (solPrev[i * nGlob + j - 1] + solPrev[i * nGlob + j + 1] + solPrev[(i - 1) * nGlob + j] + solPrev[(i + 1) * nGlob + j])) / coeff;
-
-        MPI_Sendrecv(sol.data() + massize[id] - 2 * nGlob, (id != np - 1) ? nGlob : 0, MPI_DOUBLE,  (id != np - 1) ? id + 1 : 0, 56,\
-                     sol.data(),                            (id != 0) ? nGlob : 0,      MPI_DOUBLE, (id != 0) ? id - 1 : np - 1, 56, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
-        MPI_Sendrecv(sol.data() + nGlob,                   (id != 0) ? nGlob : 0,      MPI_DOUBLE,  (id != 0) ? id - 1 : np - 1, 65, \
-                     sol.data() + massize[id] - nGlob,      (id != np - 1) ? nGlob : 0, MPI_DOUBLE, (id != np - 1) ? id + 1 : 0, 65, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
-
-        for (int i = 1; i < massize[id] / nGlob - 1; i++) // метод красно-черных
-            for (int j = (((i + shift) + 1) % 2) + 1; j < nGlob - 1; j += 2)
-                sol[i * nGlob + j] = (h * h * fRight((i + shift) * h, j * h, k) + (sol[i * nGlob + j - 1] + sol[i * nGlob + j + 1] + sol[(i - 1) * nGlob + j] + sol[(i + 1) * nGlob + j])) / coeff;
-
-        locnorm = NormVectorDif(sol, solPrev, (id == 0) ? 0 : nGlob, (id == np) ? massize[id] : massize[id] - nGlob);
-        MPI_Allreduce(&locnorm, &normFinal, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        normFinal = sqrt(normFinal);
-
-        solPrev.swap(sol);
-
-        iter++;
-
-    } while (normFinal > EPS);
-
-    return normFinal;
-}
-
-
-
-//метод красно-черных isend+irecv
-double RedBlack_3(vector<double>& sol, vector<double>& solPrev, vector<int> massize, int id, int np, int& iter) {
-    double locnorm, normFinal;
-
-    double coeff = (4. + h * h * k * k);
-
-    // сдвиг по высоте сетки для каждого процесса, то есть начало верхней доп. строки для каждого блока
-    int shift = 0; // равно нулю для нулевого процессора
-
-    if (id == np - 1) {
-        shift = nGlob - (massize[id] / nGlob); // поднимаемся с конца на высоту последнего блока с учётом доп строки
-    } else if (id != 0){
-        shift = id * (massize[id] / nGlob - 2) - 1; //спускаемся с начала на id*(высота среднего блока без учета доп строк) и поднимаемся на одну доп строку
-    }
-
-    // нужно только для Isend + Irecv
-    MPI_Request* reqSENDsAB = new MPI_Request[2];
-    MPI_Request* reqRESVsAB = new MPI_Request[2];
-    MPI_Request* reqSENDsBA = new MPI_Request[2];
-    MPI_Request* reqRESVsBA = new MPI_Request[2];
-
-    // И Н И Ц И А Л И З А Ц И Я   I s e n d   нужно только для Isend + Irecv
-
-    // Ч Ë Т   I T E R
-    // 1 Отправляем сверху вниз AB
-    MPI_Send_init(solPrev.data() + massize[id] - 2 * nGlob, (id != np - 1) ? nGlob : 0, MPI_DOUBLE,(id != np - 1) ? id + 1 : 0, 56, MPI_COMM_WORLD, reqSENDsAB);
-    // 4 Получаем снизу вверх AB
-    MPI_Recv_init(solPrev.data() + massize[id] - nGlob, (id != np - 1) ? nGlob : 0, MPI_DOUBLE,(id != np - 1) ? id + 1 : 0, 65, MPI_COMM_WORLD, reqRESVsAB);
-    // 3 Отправляем снизу вверх AB
-    MPI_Send_init(solPrev.data() + nGlob, (id != 0) ? nGlob : 0, MPI_DOUBLE, (id != 0) ? id - 1 : np - 1, 65,MPI_COMM_WORLD, reqSENDsAB + 1);
-    // 2 Получаем сверху вниз AB
-    MPI_Recv_init(solPrev.data(), (id != 0) ? nGlob : 0, MPI_DOUBLE, (id != 0) ? id - 1 : np - 1, 56,MPI_COMM_WORLD, reqRESVsAB + 1);
-
-    // Н Е Ч Ë Т   I T E R
-    // 1 Отправляем сверху вниз BA
-    MPI_Send_init(sol.data() + massize[id] - 2 * nGlob, (id != np - 1) ? nGlob : 0, MPI_DOUBLE,(id != np - 1) ? id + 1 : 0, 56, MPI_COMM_WORLD, reqSENDsBA);
-    // 4 Получаем снизу вверх BA
-    MPI_Recv_init(sol.data() + massize[id] - nGlob, (id != np - 1) ? nGlob : 0, MPI_DOUBLE,(id != np - 1) ? id + 1 : 0, 65, MPI_COMM_WORLD, reqRESVsBA);
-    // 3 Отправляем снизу вверх BA
-    MPI_Send_init(sol.data() + nGlob, (id != 0) ? nGlob : 0, MPI_DOUBLE, (id != 0) ? id - 1 : np - 1, 65,MPI_COMM_WORLD, reqSENDsBA + 1);
-    // 2 Получаем сверху вниз BA
-    MPI_Recv_init(sol.data(), (id != 0) ? nGlob : 0, MPI_DOUBLE, (id != 0) ? id - 1 : np - 1, 56, MPI_COMM_WORLD,reqRESVsBA + 1);
-
-
-    iter = 0;
-    do {
-        func_transfer(solPrev, massize, id, np, iter /*Prev поэтому AB нужно start-ануть*/, reqSENDsAB, reqRESVsAB, reqSENDsBA, reqRESVsBA, 3);
-
-        //центральная часть
-        for (int i = 2; i < massize[id] / nGlob - 2; i++) // метод Красно-черных
-            for (int j = ((i + shift) % 2) + 1; j < nGlob - 1; j += 2)
-                sol[i * nGlob + j] = (h * h * fRight((i + shift) * h, j * h, k) + (solPrev[i * nGlob + j - 1] + solPrev[i * nGlob + j + 1] + solPrev[(i - 1) * nGlob + j] + solPrev[(i + 1) * nGlob + j])) / coeff;
-
-        // опять же для Isend + Irecv
-        MPI_Waitall(2, (iter % 2 == 0) ? reqSENDsAB : reqSENDsBA /*Prev поэтому AB*/, MPI_STATUSES_IGNORE);
-        MPI_Waitall(2, (iter % 2 == 0) ? reqRESVsAB : reqRESVsBA /*Prev поэтому AB*/, MPI_STATUSES_IGNORE);
-
-
-        //начало
-        int i = 1;
-        for (int j = ((i + shift) % 2) + 1; j < nGlob - 1; j++)
-            sol[i * nGlob + j] = (h * h * fRight((i + shift) * h, j * h, k) + (solPrev[i * nGlob + j - 1] + solPrev[i * nGlob + j + 1] + solPrev[(i - 1) * nGlob + j] + solPrev[(i + 1) * nGlob + j])) / coeff;
-
-        //конец
-        i = massize[id] / nGlob - 2;
-        for (int j = ((i + shift) % 2) + 1; j < nGlob - 1; j++)
-            sol[i * nGlob + j] = (h * h * fRight((i + shift) * h, j * h, k) + (solPrev[i * nGlob + j - 1] + solPrev[i * nGlob + j + 1] + solPrev[(i - 1) * nGlob + j] + solPrev[(i + 1) * nGlob + j])) / coeff;
-
-
-
-        func_transfer(solPrev, massize, id, np, iter+1 /*sol поэтому BA нужно start-ануть*/, reqSENDsAB, reqRESVsAB, reqSENDsBA, reqRESVsBA, 3);
-
-        //центральная часть
-        for (int i = 2; i < massize[id] / nGlob - 2; i++) // метод красно-черный
-            for (int j = (((i + shift) + 1) % 2) + 1; j < nGlob - 1; j += 2)
-                sol[i * nGlob + j] = (h * h * fRight((i + shift) * h, j * h, k) + (sol[i * nGlob + j - 1] + sol[i * nGlob + j + 1] + sol[(i - 1) * nGlob + j] + sol[(i + 1) * nGlob + j])) / coeff;
-
-        // опять же для Isend + Irecv
-        MPI_Waitall(2, (iter % 2 == 0) ? reqSENDsBA : reqSENDsAB /*sol поэтому BA*/, MPI_STATUSES_IGNORE);
-        MPI_Waitall(2, (iter % 2 == 0) ? reqRESVsBA : reqRESVsAB /*sol поэтому BA*/, MPI_STATUSES_IGNORE);
-
-
-        //начало
-        i = 1;
-        for (int j = (((i + shift) + 1) % 2) + 1; j < nGlob - 1; j += 2)
-            sol[i * nGlob + j] = (h * h * fRight((i + shift) * h, j * h, k) + (sol[i * nGlob + j - 1] + sol[i * nGlob + j + 1] + sol[(i - 1) * nGlob + j] + sol[(i + 1) * nGlob + j])) / coeff;
-
-        //конец
-        i = massize[id] / nGlob - 2;
-        for (int j = (((i + shift) + 1) % 2) + 1; j < nGlob - 1; j += 2)
-            sol[i * nGlob + j] = (h * h * fRight((i + shift) * h, j * h, k) + (sol[i * nGlob + j - 1] + sol[i * nGlob + j + 1] + sol[(i - 1) * nGlob + j] + sol[(i + 1) * nGlob + j])) / coeff;
-
-
-
-        locnorm = NormVectorDif(sol, solPrev, (id == 0) ? 0 : nGlob, (id == np) ? massize[id] : massize[id] - nGlob);
-        MPI_Allreduce(&locnorm, &normFinal, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        normFinal = sqrt(normFinal);
-
-        solPrev.swap(sol);
-
-        iter++;
-
-    } while (normFinal > EPS);
-
-    return normFinal;
-}
-
-
-
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-
-
-void method_COUT(double T, double SPEEDUP, int iter, double normFinal, double errorFinal) {
-    if (SPEEDUP != 99)
-        cout << "      SPEEDUP = " << SPEEDUP << " <-------" << endl;
-    cout << "         time = " << T << endl;
-    cout << "         iter = " << iter << endl;
-    cout << "  ||k+1 - k|| = " << normFinal << endl;
-    cout << "        error = " << errorFinal << endl;
-}
-
-
-
-void method_RUN (int id, int np, vector<int> &massize, double &Tseq, int flag_meth) {
-    double T, normFinal, errorFinal;;
-    int iter;
-
-    vector<double> sol, solPrev, solReal;
-
-    if (id == 0) {
-        solReal.resize(nGlob * nGlob);
-        //матрица реальных значений
-        fToGridReal(solReal, h);
-    }
-
-    if(id != 0) {
-        sol.resize(massize[id], 0);
-        solPrev.resize(massize[id], 0);
-    } else {
-        sol.resize(nGlob * nGlob, 0);
-        solPrev.resize(nGlob * nGlob, 0);
-    }
-
-    sol.assign(sol.size(), 0);
-    solPrev.assign(solPrev.size(), 0);
-
-    switch (flag_meth) {
-        case 0: {
-            if(id == 0) {
-                Tseq = -MPI_Wtime();
-                normFinal = Jacobi_seq(sol, solPrev, iter);
-                Tseq += MPI_Wtime();
-
-                errorFinal = NormVectorDif(sol, solReal, 0, nGlob * nGlob);
-                cout << "--------------------------------\nJACOBI seq:" << endl;
-                // 99 чтобы спидап не выводился для данного последовательного метода
-                method_COUT(Tseq, 99, iter, normFinal, errorFinal);
-            }
-            MPI_Barrier(MPI_COMM_WORLD);
-        }
-            break;
-
-        case 1: {
-            if(id == 0)
-                T = -MPI_Wtime();
-            normFinal = Jacobi_PAR(sol, solPrev, massize, id, np, iter, 1);
-            if(id == 0) {
-                T += MPI_Wtime();
-            }
-
-            //сбор кусочков решения в одно
-            allSol(massize, sol, np, id);
-
-            if(id == 0) {
-                errorFinal = NormVectorDif(sol, solReal, 0, nGlob * nGlob);
-                cout << "JACOBI 1: \t\t\t(Send + Recv)" << endl;
-                // (flag_mass[0]) ? (Tseq / T) : 0  --  считаем обычный спидап если JACseq вообще считается до этого и считаем спидап нулевым иначе
-                method_COUT(T, (flag_mass[0]) ? (Tseq / T) : 0, iter, normFinal, errorFinal);
-            }
-            MPI_Barrier(MPI_COMM_WORLD);
-        }
-            break;
-
-        case 2: {
-            if(id == 0)
-                T = -MPI_Wtime();
-            normFinal = Jacobi_PAR(sol, solPrev, massize, id, np, iter, 2);
-            if(id == 0)
-                T += MPI_Wtime();
-
-            //сбор кусочков решения в одно
-            allSol(massize, sol, np, id);
-
-            if(id == 0) {
-                errorFinal = NormVectorDif(sol, solReal, 0, nGlob * nGlob);
-                cout << "JACOBI 2: \t\t\t(Sendrecv)" << endl;
-                // (flag_mass[0]) ? (Tseq / T) : 0  --  считаем обычный спидап если JACseq вообще считается до этого и считаем спидап нулевым иначе
-                method_COUT(T, (flag_mass[0]) ? (Tseq / T) : 0, iter, normFinal, errorFinal);
-            }
-            MPI_Barrier(MPI_COMM_WORLD);
-        }
-            break;
-
-        case 3: {
-            if(id == 0)
-                T = -MPI_Wtime();
-            normFinal = Jacobi_PAR(sol, solPrev, massize, id, np, iter, 3);
-            if(id == 0)
-                T += MPI_Wtime();
-
-            //сбор кусочков решения в одно
-            allSol(massize, sol, np, id);
-
-            if(id == 0) {
-                errorFinal = NormVectorDif(sol, solReal, 0, nGlob * nGlob);
-                cout << "JACOBI 3: \t\t\t(Isend + Iresv)" << endl;
-                // (flag_mass[0]) ? (Tseq / T) : 0  --  считаем обычный спидап если JACseq вообще считается до этого и считаем спидап нулевым иначе
-                method_COUT(T, (flag_mass[0]) ? (Tseq / T) : 0, iter, normFinal, errorFinal);
-            }
-            MPI_Barrier(MPI_COMM_WORLD);
-        }
-            break;
-
-        case 4: {
-            if (id == 0) {
-                Tseq = -MPI_Wtime();
-                normFinal = RedBlack_seq(sol, solPrev, iter);
-                Tseq += MPI_Wtime();
-
-                errorFinal = NormVectorDif(sol, solReal, 0, nGlob * nGlob);
-                cout << "--------------------------------\nRED-BLACK seq:" << endl;
-                // 99 чтобы спидап не выводился для данного последовательного метода
-                method_COUT(Tseq, 99, iter, normFinal, errorFinal);
-            }
-            MPI_Barrier(MPI_COMM_WORLD);
-        }
-            break;
-
-        case 5: {
-            if (id == 0)
-                T = -MPI_Wtime();
-            normFinal = RedBlack_1(sol, solPrev, massize, id, np, iter);
-            if (id == 0)
-                T += MPI_Wtime();
-
-            //сбор кусочков решения в одно
-            allSol(massize, sol, np, id);
-
-            if (id == 0) {
-                errorFinal = NormVectorDif(sol, solReal, 0, nGlob * nGlob);
-                cout << "RED-BLACK 1:      \t\t(Send + Recv)" << endl;
-                // (flag_mass[4]) ? (Tseq / T) : 0  --  считаем обычный спидап если REDseq вообще считается до этого и считаем спидап нулевым иначе
-                method_COUT(T, (flag_mass[4]) ? (Tseq / T) : 0, iter, normFinal, errorFinal);
-            }
-            MPI_Barrier(MPI_COMM_WORLD);
-        }
-            break;
-
-        case 6: {
-            if (id == 0)
-                T = -MPI_Wtime();
-            normFinal = RedBlack_2(sol, solPrev, massize, id, np, iter);
-            if (id == 0)
-                T += MPI_Wtime();
-
-            //сбор кусочков решения в одно
-            allSol(massize, sol, np, id);
-
-            if (id == 0) {
-                errorFinal = NormVectorDif(sol, solReal, 0, nGlob * nGlob);
-                cout << "RED-BLACK 2:      \t\t(Sendrecv)" << endl;
-                // (flag_mass[4]) ? (Tseq / T) : 0  --  считаем обычный спидап если REDseq вообще считается до этого и считаем спидап нулевым иначе
-                method_COUT(T, (flag_mass[4]) ? (Tseq / T) : 0, iter, normFinal, errorFinal);
-            }
-            MPI_Barrier(MPI_COMM_WORLD);
-        }
-            break;
-
-        case 7: {
-            if (id == 0)
-                T = -MPI_Wtime();
-            normFinal = RedBlack_3(sol, solPrev, massize, id, np, iter);
-            if (id == 0)
-                T += MPI_Wtime();
-
-            //сбор кусочков решения в одно
-            allSol(massize, sol, np, id);
-
-            if (id == 0) {
-                errorFinal = NormVectorDif(sol, solReal, 0, nGlob * nGlob);
-                cout << "RED-BLACK 3:      \t\t(Isend + Iresv)" << endl;
-                // (flag_mass[4]) ? (Tseq / T) : 0  --  считаем обычный спидап если REDseq вообще считается до этого и считаем спидап нулевым иначе
-                method_COUT(T, (flag_mass[4]) ? (Tseq / T) : 0, iter, normFinal, errorFinal);
-            }
-            MPI_Barrier(MPI_COMM_WORLD);
-        }
-            break;
-
-        default:
-            cout << "ERROR CASE in method_RUN()\n";
-    }
-
-    sol.assign(sol.size(), 0);
-    solPrev.assign(solPrev.size(), 0);
-}
-
-
-
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
 
 int main(int argc, char** argv)
 {
-    int id, np;
-    double Tseq;
-
+    int myid, np, iterations;
+    double t1, t2, t3, t4, norm_f;
     MPI_Init(&argc, &argv);
-
     MPI_Comm_size(MPI_COMM_WORLD, &np);
-    MPI_Comm_rank(MPI_COMM_WORLD, &id);
+    MPI_Comm_rank(MPI_COMM_WORLD, &myid);
+    std::vector<double> y, y_n, y_gen, u;
+    std::vector<int> el_num(np), displs(np);
 
-
-    vector<int>	massize(np);
 
     //распределение размеров блоков
-    findSize(massize, np, id);
-
-    if (id == 0) {
-        cout << " Size = " << nGlob << endl;
-        cout << "  EPS = " << EPS << endl;
-        cout << "   np = " << np << endl;
-        //вывод высот блоков:
-        cout << "    heights: " << massize[0] / nGlob - 1 << " (excluding additional lines)" << endl;
-        if (np <= 5) {
-            for (int j = 1; j < np - 1; ++j) {
-                cout << "             " << massize[j] / nGlob - 2 << endl;
+    if (myid == 0)
+    {
+        if (N % np == 0)
+        {
+            for (int i = 0; i < np; ++i)
+                el_num[i] = (N / np) * N;
+        }
+        else
+        {
+            int temp = 0;
+            for (int i = 0; i < np - 1; ++i)
+            {
+                el_num[i] = round(((double)N / (double)np)) * N;
+                temp += el_num[i] / N;
             }
-            cout << "             " << massize[np - 1] / nGlob - 1 << endl;
-        } else {
-            cout << "             " << massize[1] / nGlob - 2 << endl;
-            cout << "             ..." << endl;
-            cout << "             " << massize[np - 2] / nGlob - 2 << endl;
-            cout << "             " << massize[np - 1] / nGlob - 1 << endl;
+            el_num[np - 1] = (N - temp) * N;
+        }
+
+        displs[0] = 0;
+        for (int i = 1; i < np; ++i)
+            displs[i] = displs[i - 1] + el_num[i - 1];
+
+        for (int i = 0; i < np; ++i)
+            el_num[i] += 2 * N;
+        el_num[0] -= N;
+        el_num[np - 1] -= N;
+    }
+    //рассылка всем процессам
+    MPI_Bcast(el_num.data(), np, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(displs.data(), np, MPI_INT, 0, MPI_COMM_WORLD);
+
+
+    if (myid == 0) {
+        std::cout << "np: " << np << std::endl << std::endl;
+        y_gen.resize(N * N, 0);
+        u.resize(N * N);
+        analyt_sol(u);
+    }
+
+    if (np == 1) {
+
+        y.resize(el_num[myid], 0);
+        zero(y);
+        y_n.resize(el_num[myid], 0);
+        zero(y_n);
+
+        y.resize(N * N, 0);
+        zero(y);
+        y_n.resize(N * N, 0);
+        zero(y_n);
+
+
+        t1 = MPI_Wtime();
+        norm_f = Jacobi(y, y_n, el_num, myid, np, iterations, 0);
+        t2 = MPI_Wtime();
+        std::cout << std::endl << "Jacobi seq" << std::endl;
+        std::cout << "Time = " << t2 - t1 << std::endl;
+        std::cout << "Iterations = " << iterations << std::endl;
+        std::cout << "Error = " << norm_f << std::endl;
+        std::cout << "|y - u| = " << norm(y, u, 0, N * N) << std::endl << std::endl;
+
+        zero(y);
+        zero(y_n);
+
+        t3 = MPI_Wtime();
+        norm_f = Zeidel(y, y_n, el_num, myid, np, iterations, 0);
+        t4 = MPI_Wtime();
+        std::cout << std::endl << "Zeidel seq" << std::endl;
+        std::cout << "Time = " << t4 - t3 << std::endl;
+        std::cout << "Iterations = " << iterations << std::endl;
+        std::cout << "Error = " << norm_f << std::endl;
+        std::cout << "|y - u| = " << norm(y, u, 0, N * N) << std::endl << std::endl;
+    }
+    for (int send_type = 1; send_type <= 3; ++send_type)
+    {
+        if (np > 1) {
+            y.resize(el_num[myid], 0);
+            zero(y);
+            y_n.resize(el_num[myid], 0);
+            zero(y_n);
+
+            t1 = MPI_Wtime();
+            norm_f = Jacobi(y, y_n, el_num, myid, np, iterations, send_type);
+            t2 = MPI_Wtime();
+            if (myid == 0)
+            {
+                std::cout << "Time = " << t2 - t1 << std::endl;
+                std::cout << "Iterations = " << iterations << std::endl;
+                std::cout << "Error = " << norm_f << std::endl;
+            }
+            general_y(el_num, y, y_gen, displs, np, myid);
+            if (myid == 0)
+                std::cout << "|y - u| = " << norm(y_gen, u, 0, N * N) << std::endl << std::endl;
+            MPI_Barrier(MPI_COMM_WORLD);
+
+            y.resize(el_num[myid], 0);
+            zero(y);
+            y_n.resize(el_num[myid], 0);
+            zero(y_n);
+
+            t1 = MPI_Wtime();
+            norm_f = Zeidel(y, y_n, el_num, myid, np, iterations, send_type);
+            t2 = MPI_Wtime();
+            if (myid == 0)
+            {
+                std::cout << "Time = " << t2 - t1 << std::endl;
+                std::cout << "Iterations = " << iterations << std::endl;
+                std::cout << "Error = " << norm_f << std::endl;
+            }
+            general_y(el_num, y, y_gen, displs, np, myid);
+            if (myid == 0)
+                std::cout << "|y - u| = " << norm(y_gen, u, 0, N * N) << std::endl << std::endl;
+            MPI_Barrier(MPI_COMM_WORLD);
         }
     }
-
-    //идём по массиву флагов flag_mass и для каждого флага вызываем соответствующий метод если там стоит 1
-    for (int j = 0; j < 8; ++j) {
-        if (flag_mass[j]) {
-            method_RUN(id, np, massize, Tseq, j);
-        }
-    }
-
-    if (id == 0) {
-
-
-
-        cout << "\n\n\n\n\n";
-    }
-
     MPI_Finalize();
 }
