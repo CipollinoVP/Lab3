@@ -380,10 +380,8 @@ int main(int argc, char** argv)
     MPI_Comm_rank(MPI_COMM_WORLD, &my_id);
     std::vector<double> y, y_n, y_gen, u;
     std::vector<int> el_num(np), displs(np);
-
+    double time_seq_J, time_seq_Z;
     if (my_id == 0){
-        double time_seq_J, time_seq_Z;
-
         std::vector<double> y_seq(N*N,0);
         std::vector<double> y_n_seq(N*N,0);
         std::vector<int> el_num_seq(0);
