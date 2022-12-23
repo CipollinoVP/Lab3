@@ -188,21 +188,26 @@ double Zeidel(std::vector<double>& y, std::vector<double>& y_n, std::vector<int>
     //последовательный
     if (np == 1)
     {
-        iterations = 0;
-        do
-        {
-            ++iterations;
-            for (int i = 1; i < N - 1; ++i)
-                for (int j = (i % 2) + 1; j < N - 1; j += 2)
-                    y[i * N + j] = (h * h * f(i * h, j * h) + (y_n[i * N + j - 1] + y_n[i * N + j + 1] + y_n[(i - 1) * N + j] + y_n[(i + 1) * N + j])) / coef;
+        if (my_id == 0) {
+            iterations = 0;
+            do {
+                ++iterations;
+                for (int i = 1; i < N - 1; ++i)
+                    for (int j = (i % 2) + 1; j < N - 1; j += 2)
+                        y[i * N + j] = (h * h * f(i * h, j * h) +
+                                        (y_n[i * N + j - 1] + y_n[i * N + j + 1] + y_n[(i - 1) * N + j] +
+                                         y_n[(i + 1) * N + j])) / coef;
 
-            for (int i = 1; i < N - 1; ++i)
-                for (int j = ((i + 1) % 2) + 1; j < N - 1; j += 2)
-                    y[i * N + j] = (h * h * f(i * h, j * h) + (y[i * N + j - 1] + y[i * N + j + 1] + y[(i - 1) * N + j] + y[(i + 1) * N + j])) / coef;
+                for (int i = 1; i < N - 1; ++i)
+                    for (int j = ((i + 1) % 2) + 1; j < N - 1; j += 2)
+                        y[i * N + j] = (h * h * f(i * h, j * h) +
+                                        (y[i * N + j - 1] + y[i * N + j + 1] + y[(i - 1) * N + j] +
+                                         y[(i + 1) * N + j])) / coef;
 
-            norm_f = norm(y, y_n, 0, N * N);
-            y_n.swap(y);
-        } while (norm_f > eps);
+                norm_f = norm(y, y_n, 0, N * N);
+                y_n.swap(y);
+            } while (norm_f > eps);
+        }
     }
     //параллельный
     if (np > 1)
@@ -389,7 +394,7 @@ int main(int argc, char** argv)
         analytic_solve(u_seq);
 
         t1 = MPI_Wtime();
-        norm_f = Jacobi(y_seq, y_n_seq, el_num_seq, my_id, 0, iterations, 0);
+        norm_f = Jacobi(y_seq, y_n_seq, el_num_seq, my_id, 1, iterations, 0);
         t2 = MPI_Wtime();
         std::cout << std::endl << "Jacobi seq" << std::endl;
         std::cout << "Time = " << t2 - t1 << std::endl;
@@ -402,7 +407,7 @@ int main(int argc, char** argv)
         zero(y_n_seq);
 
         t3 = MPI_Wtime();
-        norm_f = Zeidel(y_seq, y_n_seq, el_num_seq, my_id, np, iterations, 0);
+        norm_f = Zeidel(y_seq, y_n_seq, el_num_seq, my_id, 1, iterations, 0);
         t4 = MPI_Wtime();
         time_seq_Z = t2 - t1;
         std::cout << std::endl << "Zeidel seq" << std::endl;
