@@ -4,7 +4,7 @@
 #include <vector>
 
 const double eps = 1.e-5;
-const int N = 1260; //количество точек
+const int N = 8000; //количество точек
 const double h = 1.0 / (N - 1); //шаг
 const double k = 1.0 / h;
 const double coef = (4.0 + h * h * k * k);
