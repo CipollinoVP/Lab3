@@ -374,37 +374,6 @@ int main(int argc, char** argv)
 {
     int my_id, np, iterations;
     double t1, t2, t3, t4, norm_f;
-    double time_seq_J, time_seq_Z;
-
-    std::vector<double> y_seq(N*N,0);
-    std::vector<double> y_n_seq(N*N,0);
-    std::vector<int> el_num_seq(0);
-    std::vector<double> u_seq(N*N);
-    analytic_solve(u_seq);
-
-    t1 = MPI_Wtime();
-    norm_f = Jacobi(y_seq, y_n_seq, el_num_seq, my_id, 0, iterations, 0);
-    t2 = MPI_Wtime();
-    std::cout << std::endl << "Jacobi seq" << std::endl;
-    std::cout << "Time = " << t2 - t1 << std::endl;
-    time_seq_J = t2 - t1;
-    std::cout << "Iterations = " << iterations << std::endl;
-    std::cout << "Error = " << norm_f << std::endl;
-    std::cout << "|y - u| = " << norm(y_seq, u_seq, 0, N * N) << std::endl << std::endl;
-
-    zero(y_seq);
-    zero(y_n_seq);
-
-    t3 = MPI_Wtime();
-    norm_f = Zeidel(y_seq, y_n_seq, el_num_seq, my_id, np, iterations, 0);
-    t4 = MPI_Wtime();
-    time_seq_Z = t2 - t1;
-    std::cout << std::endl << "Zeidel seq" << std::endl;
-    std::cout << "Time = " << t4 - t3 << std::endl;
-    std::cout << "Iterations = " << iterations << std::endl;
-    std::cout << "Error = " << norm_f << std::endl;
-    std::cout << "|y - u| = " << norm(y_seq, u_seq, 0, N * N) << std::endl << std::endl;
-
 
     MPI_Init(&argc, &argv);
     MPI_Comm_size(MPI_COMM_WORLD, &np);
@@ -412,6 +381,38 @@ int main(int argc, char** argv)
     std::vector<double> y, y_n, y_gen, u;
     std::vector<int> el_num(np), displs(np);
 
+    if (my_id == 0){
+        double time_seq_J, time_seq_Z;
+
+        std::vector<double> y_seq(N*N,0);
+        std::vector<double> y_n_seq(N*N,0);
+        std::vector<int> el_num_seq(0);
+        std::vector<double> u_seq(N*N);
+        analytic_solve(u_seq);
+
+        t1 = MPI_Wtime();
+        norm_f = Jacobi(y_seq, y_n_seq, el_num_seq, my_id, 0, iterations, 0);
+        t2 = MPI_Wtime();
+        std::cout << std::endl << "Jacobi seq" << std::endl;
+        std::cout << "Time = " << t2 - t1 << std::endl;
+        time_seq_J = t2 - t1;
+        std::cout << "Iterations = " << iterations << std::endl;
+        std::cout << "Error = " << norm_f << std::endl;
+        std::cout << "|y - u| = " << norm(y_seq, u_seq, 0, N * N) << std::endl << std::endl;
+
+        zero(y_seq);
+        zero(y_n_seq);
+
+        t3 = MPI_Wtime();
+        norm_f = Zeidel(y_seq, y_n_seq, el_num_seq, my_id, np, iterations, 0);
+        t4 = MPI_Wtime();
+        time_seq_Z = t2 - t1;
+        std::cout << std::endl << "Zeidel seq" << std::endl;
+        std::cout << "Time = " << t4 - t3 << std::endl;
+        std::cout << "Iterations = " << iterations << std::endl;
+        std::cout << "Error = " << norm_f << std::endl;
+        std::cout << "|y - u| = " << norm(y_seq, u_seq, 0, N * N) << std::endl << std::endl;
+    }
 
     //распределение размеров блоков
     if (my_id == 0)
